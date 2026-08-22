@@ -32,16 +32,6 @@ Future<void> main() async {
   await discovery.start();
 
   final tray = WindowsTray();
-  final trayOk = await tray.init(
-    onShow: () async {
-      // 窗口已在托盘回调中 ShowWindow 恢复，此处仅留回调位
-    },
-    onExit: () async {
-      await discovery.stop();
-      await server.stop();
-      exit(0);
-    },
-  );
 
   runApp(SyncMateWindowsApp(
     server: server,
@@ -51,11 +41,25 @@ Future<void> main() async {
     auditLogPath: server.auditLogPath,
   ));
 
-  if (!trayOk) {
-    debugPrint('系统托盘不可用：关闭窗口将直接退出应用');
-  } else {
-    debugPrint('已驻留系统托盘：关闭窗口将隐藏到托盘，右键托盘图标可退出');
-  }
+  // 主窗口在 runApp 后首帧才创建，必须延后初始化托盘，否则 FindWindow 失败。
+  WidgetsBinding.instance.addPostFrameCallback((_) async {
+    final trayOk = await tray.init(
+      onShow: () async {
+        // 窗口已在托盘回调中 ShowWindow 恢复，此处仅留回调位
+      },
+      onExit: () async {
+        await discovery.stop();
+        await server.stop();
+        exit(0);
+      },
+    );
+
+    if (!trayOk) {
+      debugPrint('系统托盘不可用：关闭窗口将直接退出应用');
+    } else {
+      debugPrint('已驻留系统托盘：关闭窗口将隐藏到托盘，右键托盘图标可退出');
+    }
+  });
 }
 
 /// 操作留痕路径：%APPDATA%\SyncMate\audit.log；不可写则返回 null（留痕关闭）。
