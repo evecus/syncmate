@@ -16,6 +16,8 @@ import 'package:flutter/foundation.dart' show debugPrint;
 /// 可安全调用。
 class WindowsTray {
   /// 尝试初始化托盘。非 Windows 或失败时返回 false（调用方降级为普通退出）。
+  ///
+  /// 必须在 Flutter 主窗口已创建后调用（例如 [WidgetsBinding.instance.addPostFrameCallback]）。
   Future<bool> init({
     required Future<void> Function() onShow,
     required Future<void> Function() onExit,
@@ -25,7 +27,10 @@ class WindowsTray {
       _onShow = onShow;
       _onExit = onExit;
       final hwnd = _findMainWindow();
-      if (hwnd == 0) return false;
+      if (hwnd == 0) {
+        debugPrint('WindowsTray: 未找到主窗口 FLUTTER_RUNNER_WIN32_WINDOW');
+        return false;
+      }
       _hwnd = hwnd;
       _proc = NativeCallable<_WndProcNative>.isolateLocal(
         _wndProc,
@@ -80,6 +85,8 @@ class WindowsTray {
   Future<void> Function()? _onExit;
 
   static const _gwlWndProc = -4;
+  static const _gclpHicon = -14;
+  static const _gclpHiconSm = -34;
   static const _wmUser = 0x0400;
   static const _wmClose = 0x0010;
   static const _callbackMessage = _wmUser + 1;
@@ -87,6 +94,7 @@ class WindowsTray {
   static const _wmLButtonUp = 0x0202;
   static const _swHide = 0;
   static const _swShow = 5;
+  static const _swRestore = 9;
   static const _nifMessage = 0x1;
   static const _nifIcon = 0x2;
   static const _nifTip = 0x4;
@@ -97,6 +105,7 @@ class WindowsTray {
   static const _lmemZeroInit = 0x40;
   static const _tpmReturnCmd = 0x0100;
   static const _tpmRightButton = 0x0002;
+  static const _idiApplication = 32512;
 
   /// 子类窗口过程。签名须与 WNDPROC 的 Dart 表示一致：
   /// (Pointer, int, int, int) → int，返回 LRESULT。
@@ -129,7 +138,8 @@ class WindowsTray {
 
   Future<void> _restoreWindow() async {
     if (_hwnd == 0) return;
-    _showWindow(_hwnd, _swShow);
+    // SW_RESTORE 可从最小化/隐藏状态正确恢复
+    _showWindow(_hwnd, _swRestore);
     _setForegroundWindow(_hwnd);
     await _onShow?.call();
   }
@@ -177,6 +187,7 @@ class WindowsTray {
 
   static final _user32 = DynamicLibrary.open('user32.dll');
   static final _kernel32 = DynamicLibrary.open('kernel32.dll');
+  static final _shell32 = DynamicLibrary.open('shell32.dll');
 
   static final _findWindowW = _user32.lookupFunction<
       IntPtr Function(Pointer<Uint16>, Pointer<Uint16>),
@@ -185,6 +196,10 @@ class WindowsTray {
   static final _setWindowLongPtrW = _user32.lookupFunction<
       IntPtr Function(IntPtr, Int32, IntPtr),
       int Function(int, int, int)>('SetWindowLongPtrW');
+
+  static final _getClassLongPtrW = _user32.lookupFunction<
+      IntPtr Function(IntPtr, Int32),
+      int Function(int, int)>('GetClassLongPtrW');
 
   static final _callWindowProcW = _user32.lookupFunction<
       IntPtr Function(IntPtr, IntPtr, Uint32, IntPtr, IntPtr),
@@ -198,7 +213,8 @@ class WindowsTray {
       Int32 Function(IntPtr),
       int Function(int)>('SetForegroundWindow');
 
-  static final _shellNotifyIconW = _user32.lookupFunction<
+  /// Shell_NotifyIconW 位于 shell32.dll（不是 user32）。
+  static final _shellNotifyIconW = _shell32.lookupFunction<
       Int32 Function(IntPtr, Pointer<_NotifyIconData>),
       int Function(int, Pointer<_NotifyIconData>)>('Shell_NotifyIconW');
 
@@ -245,6 +261,18 @@ class WindowsTray {
     }
   }
 
+  /// 优先取窗口自身小图标，其次大图标，最后回退系统默认应用图标。
+  int _resolveTrayIcon(int hwnd) {
+    var icon = _getClassLongPtrW(hwnd, _gclpHiconSm);
+    if (icon == 0) {
+      icon = _getClassLongPtrW(hwnd, _gclpHicon);
+    }
+    if (icon == 0) {
+      icon = _loadIconW(0, _idiApplication); // IDI_APPLICATION
+    }
+    return icon;
+  }
+
   bool _addIcon(int hwnd) {
     final data = _localAlloc(_lmemZeroInit, sizeOf<_NotifyIconData>());
     if (data == nullptr) return false;
@@ -255,7 +283,7 @@ class WindowsTray {
       nid.uID = _idIcon;
       nid.uFlags = _nifMessage | _nifIcon | _nifTip;
       nid.uCallbackMessage = _callbackMessage;
-      nid.hIcon = _loadIconW(0, 32512); // IDI_APPLICATION
+      nid.hIcon = _resolveTrayIcon(hwnd);
       _writeUtf16Into(nid.szTip, 'SyncMate');
       return _shellNotifyIconW(1, data.cast<_NotifyIconData>()) != 0; // NIM_ADD
     } finally {
