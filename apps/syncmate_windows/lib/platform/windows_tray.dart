@@ -93,7 +93,6 @@ class WindowsTray {
   static const _wmRButtonUp = 0x0205;
   static const _wmLButtonUp = 0x0202;
   static const _swHide = 0;
-  static const _swShow = 5;
   static const _swRestore = 9;
   static const _nifMessage = 0x1;
   static const _nifIcon = 0x2;
