@@ -1,0 +1,26 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="arrowTop" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#EAF0FF"/>
+    </linearGradient>
+  </defs>
+  <!-- Adaptive icon safe zone: content should sit within center ~66% (66x66 of 108x108 grid).
+       Canvas here is 1024, so scale the sync glyph down and center it. -->
+  <g transform="translate(512,512) scale(0.72)">
+    <path d="M -196 -6
+             A 196 196 0 0 1 120 -175"
+          fill="none" stroke="url(#arrowTop)" stroke-width="56"
+          stroke-linecap="round"/>
+    <path d="M 68 -224 L 172 -210 L 148 -122 Z" fill="#FFFFFF"/>
+
+    <path d="M 196 6
+             A 196 196 0 0 1 -120 175"
+          fill="none" stroke="#FFFFFF" stroke-width="56"
+          stroke-linecap="round" stroke-opacity="0.92"/>
+    <path d="M -68 224 L -172 210 L -148 122 Z" fill="#FFFFFF" fill-opacity="0.92"/>
+
+    <circle cx="0" cy="0" r="46" fill="#FFFFFF"/>
+    <circle cx="0" cy="0" r="46" fill="none" stroke="#5B6EF5" stroke-width="6" stroke-opacity="0.25"/>
+  </g>
+</svg>

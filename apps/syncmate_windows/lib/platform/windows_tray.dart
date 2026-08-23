@@ -1,0 +1,456 @@
+import 'dart:async';
+import 'dart:ffi';
+import 'dart:io' show Platform;
+
+import 'package:flutter/foundation.dart' show debugPrint;
+
+/// Windows 系统托盘图标（纯 dart:ffi 实现，零插件依赖）。
+///
+/// 通过子类化 Flutter 主窗口（SetWindowLongPtrW GWLP_WNDPROC）接收
+/// Shell_NotifyIcon 的回调消息；单击恢复窗口，右键弹出菜单（显示 / 退出）。
+///
+/// FFI 说明：Dart 3.9+ 中 IntPtr/Uint32/UintPtr 为标记类，不可在 Dart 侧
+/// 构造；NativeCallable 回调必须使用其 Dart 表示类型（int），原生指针
+/// 经 nativeFunction.address 取得，调用原始窗口过程用 CallWindowProcW。
+/// 回调经 isolateLocal 绑定主线程消息泵，Windows 消息均在 UI 线程派发，
+/// 可安全调用。
+class WindowsTray {
+  /// 尝试初始化托盘。非 Windows 或失败时返回 false（调用方降级为普通退出）。
+  ///
+  /// 必须在 Flutter 主窗口已创建后调用（例如 [WidgetsBinding.instance.addPostFrameCallback]）。
+  /// 内部会重试几次查找主窗口，避免首帧时句柄尚未就绪。
+  Future<bool> init({
+    required Future<void> Function() onShow,
+    required Future<void> Function() onExit,
+  }) async {
+    if (!Platform.isWindows) return false;
+    try {
+      _onShow = onShow;
+      _onExit = onExit;
+      var hwnd = 0;
+      for (var attempt = 0; attempt < 10; attempt++) {
+        hwnd = _findMainWindow();
+        if (hwnd != 0) break;
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      if (hwnd == 0) {
+        debugPrint('WindowsTray: 未找到主窗口（已重试）');
+        return false;
+      }
+      _hwnd = hwnd;
+      _proc = NativeCallable<_WndProcNative>.isolateLocal(
+        _wndProc,
+        exceptionalReturn: 0,
+      );
+      final procPointer = _proc!.nativeFunction;
+      _originalProc = _setWindowLongPtrW(
+        hwnd,
+        _gwlWndProc,
+        procPointer.address,
+      );
+      if (_originalProc == 0) {
+        debugPrint('WindowsTray: SetWindowLongPtrW 失败');
+        _proc?.close();
+        _proc = null;
+        return false;
+      }
+      final ok = _addIcon(hwnd);
+      if (!ok) {
+        debugPrint('WindowsTray: Shell_NotifyIcon(NIM_ADD) 失败');
+        _restoreOriginalProc();
+        _proc?.close();
+        _proc = null;
+        return false;
+      }
+      _installed = true;
+      debugPrint('WindowsTray: 托盘图标已添加 hwnd=$hwnd');
+      return true;
+    } on Object catch (e, st) {
+      debugPrint('WindowsTray init failed: $e\n$st');
+      return false;
+    }
+  }
+
+  /// 退出前清理：删除托盘图标并还原窗口过程。
+  void dispose() {
+    if (!_installed) return;
+    try {
+      if (_hwnd != 0) {
+        _removeIcon(_hwnd);
+        _restoreOriginalProc();
+      }
+    } on Object {
+      // ignore
+    }
+    _proc?.close();
+    _proc = null;
+    _installed = false;
+  }
+
+  // ---------------------------------------------------------------------
+  // 状态
+  // ---------------------------------------------------------------------
+
+  bool _installed = false;
+  int _hwnd = 0;
+  int _originalProc = 0;
+  NativeCallable<_WndProcNative>? _proc;
+  Future<void> Function()? _onShow;
+  Future<void> Function()? _onExit;
+
+  static const _gwlWndProc = -4;
+  static const _gclpHicon = -14;
+  static const _gclpHiconSm = -34;
+  static const _wmUser = 0x0400;
+  static const _wmClose = 0x0010;
+  static const _callbackMessage = _wmUser + 1;
+  static const _wmRButtonUp = 0x0205;
+  static const _wmLButtonUp = 0x0202;
+  static const _swHide = 0;
+  static const _swRestore = 9;
+  static const _nifMessage = 0x1;
+  static const _nifIcon = 0x2;
+  static const _nifTip = 0x4;
+  static const _idIcon = 1;
+  static const _cmdShow = 1;
+  static const _cmdExit = 2;
+  static const _mfString = 0x0;
+  static const _lmemZeroInit = 0x40;
+  static const _tpmReturnCmd = 0x0100;
+  static const _tpmRightButton = 0x0002;
+  static const _idiApplication = 32512;
+
+  /// 子类窗口过程。签名须与 WNDPROC 的 Dart 表示一致：
+  /// (Pointer, int, int, int) → int，返回 LRESULT。
+  int _wndProc(Pointer hwnd, int message, int wParam, int lParam) {
+    if (message == _wmClose) {
+      // 关闭按钮 → 隐藏到托盘，应用与文件服务继续运行
+      _showWindow(_hwnd, _swHide);
+      return 0;
+    }
+    if (message == _callbackMessage) {
+      if (wParam == _idIcon) {
+        if (lParam == _wmLButtonUp) {
+          unawaited(_restoreWindow());
+          return 0;
+        }
+        if (lParam == _wmRButtonUp) {
+          unawaited(_showContextMenu());
+          return 0;
+        }
+      }
+      return 0;
+    }
+    return _callOriginal(hwnd, message, wParam, lParam);
+  }
+
+  int _callOriginal(Pointer hwnd, int message, int wParam, int lParam) {
+    if (_originalProc == 0) return 0;
+    return _callWindowProcW(_originalProc, hwnd.address, message, wParam, lParam);
+  }
+
+  Future<void> _restoreWindow() async {
+    if (_hwnd == 0) return;
+    // SW_RESTORE 可从最小化/隐藏状态正确恢复
+    _showWindow(_hwnd, _swRestore);
+    _setForegroundWindow(_hwnd);
+    await _onShow?.call();
+  }
+
+  Future<void> _showContextMenu() async {
+    if (_hwnd == 0) return;
+    final menu = _createPopupMenu();
+    if (menu == 0) return;
+    try {
+      final showText = _utf16('显示主窗口');
+      final exitText = _utf16('退出');
+      _appendMenuW(menu, _mfString, _cmdShow, showText);
+      _appendMenuW(menu, _mfString, _cmdExit, exitText);
+      final pt = _readCursorPos();
+      final command = _trackPopupMenu(
+        menu,
+        _tpmReturnCmd | _tpmRightButton,
+        pt[0],
+        pt[1],
+        0,
+        _hwnd,
+        nullptr,
+      );
+      if (command == _cmdShow) {
+        await _restoreWindow();
+      } else if (command == _cmdExit) {
+        await _exitApp();
+      }
+      _freeUtf16(showText);
+      _freeUtf16(exitText);
+    } finally {
+      _destroyMenu(menu);
+    }
+  }
+
+  Future<void> _exitApp() async {
+    final onExit = _onExit;
+    dispose();
+    await onExit?.call();
+  }
+
+  // ---------------------------------------------------------------------
+  // 原生绑定
+  // ---------------------------------------------------------------------
+
+  static final _user32 = DynamicLibrary.open('user32.dll');
+  static final _kernel32 = DynamicLibrary.open('kernel32.dll');
+  static final _shell32 = DynamicLibrary.open('shell32.dll');
+
+  static final _enumWindows = _user32.lookupFunction<
+      Int32 Function(Pointer<NativeFunction<_EnumWindowsProcNative>>, IntPtr),
+      int Function(Pointer<NativeFunction<_EnumWindowsProcNative>>,
+          int)>('EnumWindows');
+
+  static final _getWindowThreadProcessId = _user32.lookupFunction<
+      Uint32 Function(IntPtr, Pointer<Uint32>),
+      int Function(int, Pointer<Uint32>)>('GetWindowThreadProcessId');
+
+  static final _isWindowVisible = _user32.lookupFunction<
+      Int32 Function(IntPtr),
+      int Function(int)>('IsWindowVisible');
+
+  static final _getCurrentProcessId = _kernel32.lookupFunction<
+      Uint32 Function(),
+      int Function()>('GetCurrentProcessId');
+
+  static final _setWindowLongPtrW = _user32.lookupFunction<
+      IntPtr Function(IntPtr, Int32, IntPtr),
+      int Function(int, int, int)>('SetWindowLongPtrW');
+
+  static final _getClassLongPtrW = _user32.lookupFunction<
+      IntPtr Function(IntPtr, Int32),
+      int Function(int, int)>('GetClassLongPtrW');
+
+  static final _callWindowProcW = _user32.lookupFunction<
+      IntPtr Function(IntPtr, IntPtr, Uint32, IntPtr, IntPtr),
+      int Function(int, int, int, int, int)>('CallWindowProcW');
+
+  static final _showWindow = _user32.lookupFunction<
+      Int32 Function(IntPtr, Int32),
+      int Function(int, int)>('ShowWindow');
+
+  static final _setForegroundWindow = _user32.lookupFunction<
+      Int32 Function(IntPtr),
+      int Function(int)>('SetForegroundWindow');
+
+  /// Shell_NotifyIconW 位于 shell32.dll（不是 user32）。
+  static final _shellNotifyIconW = _shell32.lookupFunction<
+      Int32 Function(IntPtr, Pointer<_NotifyIconData>),
+      int Function(int, Pointer<_NotifyIconData>)>('Shell_NotifyIconW');
+
+  static final _loadIconW = _user32.lookupFunction<
+      IntPtr Function(IntPtr, IntPtr),
+      int Function(int, int)>('LoadIconW');
+
+  static final _createPopupMenu = _user32.lookupFunction<
+      IntPtr Function(),
+      int Function()>('CreatePopupMenu');
+
+  static final _appendMenuW = _user32.lookupFunction<
+      Int32 Function(IntPtr, Uint32, UintPtr, Pointer<Uint16>),
+      int Function(int, int, int, Pointer<Uint16>)>('AppendMenuW');
+
+  static final _trackPopupMenu = _user32.lookupFunction<
+      Uint32 Function(
+          IntPtr, Uint32, Int32, Int32, Int32, IntPtr, Pointer<IntPtr>),
+      int Function(int, int, int, int, int, int, Pointer<IntPtr>)>(
+      'TrackPopupMenu');
+
+  static final _destroyMenu = _user32.lookupFunction<
+      Int32 Function(IntPtr),
+      int Function(int)>('DestroyMenu');
+
+  static final _getCursorPos = _user32.lookupFunction<
+      Int32 Function(Pointer<Int32>),
+      int Function(Pointer<Int32>)>('GetCursorPos');
+
+  static final _localAlloc = _kernel32.lookupFunction<
+      Pointer<Void> Function(Uint32, UintPtr),
+      Pointer<Void> Function(int, int)>('LocalAlloc');
+
+  static final _localFree = _kernel32.lookupFunction<
+      Pointer<Void> Function(Pointer<Void>),
+      Pointer<Void> Function(Pointer<Void>)>('LocalFree');
+
+  /// 查找本进程的顶层可见窗口。
+  ///
+  /// 不依赖具体窗口类名（不同 Flutter 版本 / 模板可能不同），也不使用
+  /// GetForegroundWindow 兜底（首帧渲染较慢、或用户此时切到了其他程序时，
+  /// 前台窗口可能根本不是本应用，误换 WNDPROC 会导致托盘失效甚至影响
+  /// 其他进程）。改用 EnumWindows 枚举所有顶层窗口，通过
+  /// GetWindowThreadProcessId 匹配当前进程 PID，只认自己的窗口。
+  int _findMainWindow() {
+    final targetPid = _getCurrentProcessId();
+    var found = 0;
+    final callback = NativeCallable<_EnumWindowsProcNative>.isolateLocal(
+      (int hwnd, int lParam) {
+        final pidBuf = _localAlloc(_lmemZeroInit, 4).cast<Uint32>();
+        try {
+          _getWindowThreadProcessId(hwnd, pidBuf);
+          if (pidBuf.value == targetPid && _isWindowVisible(hwnd) != 0) {
+            found = hwnd;
+            return 0; // 停止枚举
+          }
+        } finally {
+          _localFree(pidBuf.cast<Void>());
+        }
+        return 1; // 继续枚举
+      },
+      exceptionalReturn: 1,
+    );
+    try {
+      _enumWindows(callback.nativeFunction, 0);
+    } finally {
+      callback.close();
+    }
+    return found;
+  }
+
+  /// 优先取窗口自身小图标，其次大图标，最后回退系统默认应用图标。
+  int _resolveTrayIcon(int hwnd) {
+    var icon = _getClassLongPtrW(hwnd, _gclpHiconSm);
+    if (icon == 0) {
+      icon = _getClassLongPtrW(hwnd, _gclpHicon);
+    }
+    if (icon == 0) {
+      icon = _loadIconW(0, _idiApplication); // IDI_APPLICATION
+    }
+    return icon;
+  }
+
+  bool _addIcon(int hwnd) {
+    final data = _localAlloc(_lmemZeroInit, sizeOf<_NotifyIconData>());
+    if (data == nullptr) return false;
+    try {
+      final nid = data.cast<_NotifyIconData>().ref;
+      nid.cbSize = sizeOf<_NotifyIconData>();
+      nid.hWnd = hwnd;
+      nid.uID = _idIcon;
+      nid.uFlags = _nifMessage | _nifIcon | _nifTip;
+      nid.uCallbackMessage = _callbackMessage;
+      nid.hIcon = _resolveTrayIcon(hwnd);
+      _writeUtf16Into(nid.szTip, 'SyncMate');
+      return _shellNotifyIconW(1, data.cast<_NotifyIconData>()) != 0; // NIM_ADD
+    } finally {
+      _localFree(data);
+    }
+  }
+
+  void _removeIcon(int hwnd) {
+    final data = _localAlloc(_lmemZeroInit, sizeOf<_NotifyIconData>());
+    if (data == nullptr) return;
+    try {
+      final nid = data.cast<_NotifyIconData>().ref;
+      nid.cbSize = sizeOf<_NotifyIconData>();
+      nid.hWnd = hwnd;
+      nid.uID = _idIcon;
+      _shellNotifyIconW(2, data.cast<_NotifyIconData>()); // NIM_DELETE
+    } finally {
+      _localFree(data);
+    }
+  }
+
+  void _restoreOriginalProc() {
+    if (_hwnd == 0 || _originalProc == 0) return;
+    _setWindowLongPtrW(_hwnd, _gwlWndProc, _originalProc);
+    _originalProc = 0;
+  }
+
+  List<int> _readCursorPos() {
+    final pt = _localAlloc(_lmemZeroInit, 8);
+    try {
+      _getCursorPos(pt.cast<Int32>());
+      return [pt.cast<Int32>()[0], pt.cast<Int32>()[1]];
+    } finally {
+      _localFree(pt);
+    }
+  }
+
+  static Pointer<Uint16> _utf16(String text) {
+    final length = text.length + 1;
+    final buffer = _localAlloc(_lmemZeroInit, length * 2).cast<Uint16>();
+    for (var i = 0; i < text.length; i++) {
+      buffer[i] = text.codeUnitAt(i);
+    }
+    buffer[text.length] = 0;
+    return buffer;
+  }
+
+  static void _freeUtf16(Pointer<Uint16> buffer) {
+    _localFree(buffer.cast<Void>());
+  }
+
+  static void _writeUtf16Into(Array<Uint16> target, String text) {
+    const capacity = 128; // 与 _NotifyIconData.szTip 声明长度一致
+    final length = text.length < capacity - 1 ? text.length : capacity - 1;
+    for (var i = 0; i < length; i++) {
+      target[i] = text.codeUnitAt(i);
+    }
+    target[length] = 0;
+  }
+}
+
+/// NOTIFYICONDATAW 布局（x64 = 976 字节）。
+final class _NotifyIconData extends Struct {
+  @Uint32()
+  external int cbSize;
+
+  @IntPtr()
+  external int hWnd;
+
+  @Uint32()
+  external int uID;
+
+  @Uint32()
+  external int uFlags;
+
+  @Uint32()
+  external int uCallbackMessage;
+
+  @IntPtr()
+  external int hIcon;
+
+  @Array(128)
+  external Array<Uint16> szTip;
+
+  @Uint32()
+  external int dwState;
+
+  @Uint32()
+  external int dwStateMask;
+
+  @Array(256)
+  external Array<Uint16> szInfo;
+
+  @Uint32()
+  external int uTimeoutOrVersion;
+
+  @Array(64)
+  external Array<Uint16> szInfoTitle;
+
+  @Uint32()
+  external int dwInfoFlags;
+
+  @Array(16)
+  external Array<Uint8> guidItem;
+
+  @IntPtr()
+  external int hBalloonIcon;
+}
+
+/// WNDPROC 原生签名：LRESULT CALLBACK(HWND, UINT, WPARAM, LPARAM)。
+typedef _WndProcNative = IntPtr Function(
+  Pointer hWnd,
+  Uint32 uMsg,
+  IntPtr wParam,
+  IntPtr lParam,
+);
+
+/// WNDENUMPROC 原生签名：BOOL CALLBACK(HWND, LPARAM)。
+typedef _EnumWindowsProcNative = Int32 Function(IntPtr hWnd, IntPtr lParam);
